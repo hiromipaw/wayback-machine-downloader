@@ -17,8 +17,9 @@ class WaybackMachineDownloader
   VERSION = "2.3.1"
 
   attr_accessor :base_url, :exact_url, :directory, :all_timestamps,
-    :from_timestamp, :to_timestamp, :only_filter, :exclude_filter, 
-    :all, :maximum_pages, :threads_count
+    :from_timestamp, :to_timestamp, :only_filter, :exclude_filter,
+    :all, :maximum_pages, :threads_count, :sleep_time, :retries,
+    :first_entries, :last_entries
 
   def initialize params
     @base_url = params[:base_url]
@@ -32,6 +33,8 @@ class WaybackMachineDownloader
     @all = params[:all]
     @maximum_pages = params[:maximum_pages] ? params[:maximum_pages].to_i : 100
     @threads_count = params[:threads_count].to_i
+    @sleep_time = params[:sleep_time] || 0 # Default to 0 seconds if not specified
+    @retries = params[:retries] || 3 # Default to 3 retries if not specified
   end
 
   def backup_name
@@ -105,7 +108,7 @@ class WaybackMachineDownloader
     get_all_snapshots_to_consider.each do |file_timestamp, file_url|
       next unless file_url.include?('/')
       file_id = file_url.split('/')[3..-1].join('/')
-      file_id = CGI::unescape file_id 
+      file_id = CGI::unescape file_id
       file_id = file_id.tidy_bytes unless file_id == ""
       if file_id.nil?
         puts "Malformed file url, ignoring: #{file_url}"
@@ -132,7 +135,7 @@ class WaybackMachineDownloader
       next unless file_url.include?('/')
       file_id = file_url.split('/')[3..-1].join('/')
       file_id_and_timestamp = [file_timestamp, file_id].join('/')
-      file_id_and_timestamp = CGI::unescape file_id_and_timestamp 
+      file_id_and_timestamp = CGI::unescape file_id_and_timestamp
       file_id_and_timestamp = file_id_and_timestamp.tidy_bytes unless file_id_and_timestamp == ""
       if file_id.nil?
         puts "Malformed file url, ignoring: #{file_url}"
@@ -199,7 +202,7 @@ class WaybackMachineDownloader
       puts "\t* Exclude filter too wide (#{exclude_filter.to_s})" if @exclude_filter
       return
     end
- 
+
     puts "#{file_list_by_timestamp.count} files to download:"
 
     threads = []
@@ -243,31 +246,38 @@ class WaybackMachineDownloader
     end
   end
 
-  def download_file file_remote_info
-    current_encoding = "".encoding
-    file_url = file_remote_info[:file_url].encode(current_encoding)
-    file_id = file_remote_info[:file_id]
-    file_timestamp = file_remote_info[:timestamp]
-    file_path_elements = file_id.split('/')
-    if file_id == ""
-      dir_path = backup_path
-      file_path = backup_path + 'index.html'
-    elsif file_url[-1] == '/' or not file_path_elements[-1].include? '.'
-      dir_path = backup_path + file_path_elements[0..-1].join('/')
-      file_path = backup_path + file_path_elements[0..-1].join('/') + '/index.html'
-    else
-      dir_path = backup_path + file_path_elements[0..-2].join('/')
-      file_path = backup_path + file_path_elements[0..-1].join('/')
-    end
-    if Gem.win_platform?
-      dir_path = dir_path.gsub(/[:*?&=<>\\|]/) {|s| '%' + s.ord.to_s(16) }
-      file_path = file_path.gsub(/[:*?&=<>\\|]/) {|s| '%' + s.ord.to_s(16) }
-    end
-    unless File.exist? file_path
-      begin
-        structure_dir_path dir_path
+  def download_file(file_remote_info)
+    # Initialize the retry counter
+    attempts_left = @retries
+
+    # Loop to attempt the download up to the specified number of retries
+    begin
+      # Attempt the download
+      current_encoding = "".encoding
+      file_url = file_remote_info[:file_url].encode(current_encoding)
+      file_id = file_remote_info[:file_id]
+      file_timestamp = file_remote_info[:timestamp]
+      file_path_elements = file_id.split('/')
+      dir_path, file_path = if file_id == ""
+                              [backup_path, backup_path + 'index.html']
+                            elsif file_url[-1] == '/' or not file_path_elements[-1].include?('.')
+                              [backup_path + file_path_elements[0..-1].join('/'), backup_path + file_path_elements[0..-1].join('/') + '/index.html']
+                            else
+                              [backup_path + file_path_elements[0..-2].join('/'), backup_path + file_path_elements[0..-1].join('/')]
+                            end
+
+      # Adjust paths for Windows platforms
+      if Gem.win_platform?
+        dir_path = dir_path.gsub(/[:*?&=<>\\|]/) {|s| '%' + s.ord.to_s(16) }
+        file_path = file_path.gsub(/[:*?&=<>\\|]/) {|s| '%' + s.ord.to_s(16) }
+      end
+
+      # Proceed with download if the file does not exist
+      unless File.exist?(file_path)
+        structure_dir_path(dir_path) # Ensure directory structure is in place
         open(file_path, "wb") do |file|
           begin
+            # Open the URI and write the contents to the file
             URI("https://web.archive.org/web/#{file_timestamp}id_/#{file_url}").open("Accept-Encoding" => "plain") do |uri|
               file.write(uri.read)
             end
@@ -277,29 +287,25 @@ class WaybackMachineDownloader
               file.write(e.io.read)
               puts "#{file_path} saved anyway."
             end
-          rescue StandardError => e
-            puts "#{file_url} # #{e}"
+            raise e # Re-raise the exception to trigger a retry
           end
         end
-      rescue StandardError => e
-        puts "#{file_url} # #{e}"
-      ensure
-        if not @all and File.exist?(file_path) and File.size(file_path) == 0
-          File.delete(file_path)
-          puts "#{file_path} was empty and was removed."
-        end
       end
-      semaphore.synchronize do
-        @processed_file_count += 1
-        puts "#{file_url} -> #{file_path} (#{@processed_file_count}/#{file_list_by_timestamp.size})"
-      end
-    else
-      semaphore.synchronize do
-        @processed_file_count += 1
-        puts "#{file_url} # #{file_path} already exists. (#{@processed_file_count}/#{file_list_by_timestamp.size})"
+
+      # Success, reset attempts left in case of next file
+      attempts_left = @retries
+    rescue StandardError => e
+      puts "#{file_url} download failed: #{e.message}, attempts left: #{attempts_left - 1}"
+      attempts_left -= 1
+      if attempts_left > 0
+        sleep(@sleep_time) # Sleep before retrying
+        retry
+      else
+        puts "Giving up on #{file_url} after #{@retries} attempts."
       end
     end
   end
+
 
   def file_queue
     @file_queue ||= file_list_by_timestamp.each_with_object(Queue.new) { |file_info, q| q << file_info }

@@ -21,7 +21,7 @@ option_parser = OptionParser.new do |opts|
   opts.on("-s", "--all-timestamps", "Download all snapshots/timestamps for a given website") do |t|
     options[:all_timestamps] = true
   end
-  
+
   opts.on("-f", "--from TIMESTAMP", Integer, "Only files on or after timestamp supplied (ie. 20060716231334)") do |t|
     options[:from_timestamp] = t
   end
@@ -61,6 +61,15 @@ option_parser = OptionParser.new do |opts|
   opts.on("-v", "--version", "Display version") do |t|
     options[:version] = t
   end
+
+  opts.on("--sleep-time SECONDS", Integer, "Time to sleep between requests (in seconds)") do |t|
+    options[:sleep_time] = t
+  end
+
+  opts.on("--retries NUMBER", Integer, "Number of retries for each download") do |t|
+    options[:retries] = t
+  end
+
 end.parse!
 
 if (base_url = ARGV[-1])
